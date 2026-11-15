@@ -1,0 +1,13 @@
+name: astrbot_plugin_txrui
+display_name: Txrui微信接入
+author: Txrui
+version: v0.1.0
+desc: 以 WebSocket 服务端形态接入 txrui_desktop 微信桌面端采集端，把微信消息送入 AstrBot 流水线，并支持回发消息与媒体。
+repo: https://github.com/AstrBotDevs/AstrBot
+astrbot_version: ">=4.29.4"
+support_platforms:
+  - txrui
+tags:
+  - 微信
+  - 平台适配器
+  - WebSocket
