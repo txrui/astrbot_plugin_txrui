@@ -1,159 +1,75 @@
-# astrbot_plugin_txrui — 微信桌面端(txrui)接入
+# Txrui 微信接入插件
 
-把 txrui_desktop 微信桌面端采集端接进 AstrBot：
-AstrBot 侧作为 **WebSocket 服务端**，txrui_desktop 作为客户端接入，
-复用其既有的 connector 协议（纯 JSON + base64，无核心模块依赖）。
+将 `txrui_desktop` 微信桌面端采集端对接到 AstrBot，支持接收微信消息及回发消息与媒体。AstrBot 作为 WebSocket 服务端，采集端作为客户端连接。
 
-```
-微信PC窗口 ──截屏OCR──> txrui_desktop ──WS──> 本插件 ──> AstrBot Pipeline + LLM
-     ^                                          │
-     └────────── 剪贴板粘贴 <── outbound ──────┘
-```
+## 1. 启用插件
 
-## 特性
+将 `astrbot_plugin_txrui` 放入 AstrBot 的 `data/plugins/` 目录，在 WebUI「插件」页加载并启用。要求 AstrBot `>=4.29.4`。
 
-- **零协议改动**：直接复用 txrui_desktop 的 connector 协议（`hello` / `event` /
-  `media_upload` / `media_fetch` / `outbound` / `send_ack`），切换后端不需要改协议层。
-- **媒体闭环**：出站图片/文件/视频由服务端落盘（sha256 内容寻址去重），
-  客户端通过 `media_fetch` 取回本体再粘贴进微信。
-- **如实降级**：客户端不支持真语音时降级为文件段并标 `extra.file_fallback`；
-  拿不到媒体本体时降级为占位文本，**绝不引用不存在的 media_id**。
-- **不引入 DB 迁移**：媒体走文件系统 + 进程内内存索引。
+## 2. 添加平台
 
-## 部署步骤
+在 WebUI「平台」页添加 `txrui` 平台（显示名为 `txrui（微信）`），填写：
 
-### 1. 在 AstrBot WebUI 添加平台
+- 机器人 ID：如 `txrui_default`，建议只用字母、数字、下划线或短横线。
+- 监听地址：默认 `0.0.0.0`；仅本机连接可用 `127.0.0.1`。
+- 监听端口：默认 `8788`。
+- 连接令牌 `token`：设置非空令牌，采集端填写相同值。
+- 连接器 ID `connector_id`：默认 `txrui_001`，与采集端一致。
+- 微信账号 ID `account_id`：默认 `wx_001`，与采集端一致。
 
-「平台」页 → 添加平台 → 类型选 **微信桌面端(txrui)**，填：
+保存并启用机器人。所有连接与收发配置统一在平台页设置，无需单独配置插件。
 
-| 配置项 | 说明 | 默认值 |
-|---|---|---|
-| `id` | 平台实例 ID，**不能含 `:` `!` 和空白** | `txrui_default` |
-| `host` | 监听地址 | `0.0.0.0` |
-| `port` | 监听端口 | `8788` |
-| `token` | 连接令牌（**必填**，见下方安全提示） | 空 |
-| `connector_id` | 连接器 ID，须与 txrui 侧 `CONNECTOR_ID` 一致 | `txrui_001` |
-| `account_id` | 微信账号 ID，须与 txrui 侧 `WECHAT_ACCOUNT_ID` 一致 | `wx_001` |
-| `media_dir` | 媒体落盘目录 | `data/txrui_media` |
+## 3. 对接采集端
 
-开启该平台的 `enable` 开关。
+打开 `txrui_desktop` 网页控制台的「设置」页：
 
-### 2. 在 txrui_desktop 设置页填同样的令牌
+1. 勾选「AstrBot 直连」。
+2. WebSocket 地址填写 `ws://AstrBot服务器IP:8788`；同机连接可用 `ws://127.0.0.1:8788`。
+3. 填写与平台一致的令牌、连接器 ID 和微信账号 ID。
+4. 保存设置，点击「测试验证」，收到 `hello_ack` 表示握手成功。
+5. 启动采集，发送一条微信消息，检查 AstrBot 是否收到并正常回复。
 
-打开 txrui_desktop 网页控制台 → **设置** 页：
+## 注意事项
 
-- 勾选 **AstrBot 直连**
-- WS 地址填 AstrBot 插件的监听地址（默认 `ws://127.0.0.1:8788`）
-- Token 填与 AstrBot 插件 `token` **完全一致**的值
-- `CONNECTOR_ID` / 微信账号与 AstrBot 插件的 `connector_id` / `account_id` 保持一致
+- 端口被占用时，插件会给出明确错误并停止启动，不会擅自结束占用端口的其他进程。关闭或重载平台时，插件会先关闭监听 socket、断开活动连接并等待服务端关闭，释放端口后再完成生命周期清理；若仍提示端口占用，请检查重复的平台实例或其他服务。
+- 跨机器连接需放行监听端口；Docker 部署需映射 `8788:8788`。
+- 采集端应填写可访问的服务器地址，不能使用 `0.0.0.0` 作为连接地址。
+- 连接令牌应妥善保管，避免将未鉴权的服务暴露到公网。
+- 关闭插件会停止连接并注销平台类型，已保存的机器人配置会保留。
 
-点「保存设置」后点「测试验证」，应显示 `hello_ack NNNms`。
+## AstrBot 标准接口
 
-### 3. 启动 txrui 采集
+- 对照 QQ 官方适配器实现 `create_event(message)`，框架通过 `StarTools.create_event` 注入消息时，也会创建可实际回复的 `TxruiEvent`，而非仅记录指标的基础事件。
+- `get_client()` 返回 `TxruiWSServer`，可使用其 `send_outbound` 和 `media_store` 等协议接口；它不是 QQ 的 botpy 客户端，不提供 QQ 专用 API。
+- 入站消息、框架注入事件和按会话主动发送复用同一事件工厂及媒体处理逻辑，保留平台配置和账号信息。主动发送拒绝空会话及非群聊/私聊类型，避免误路由。
+- 此处补齐平台接口不会更改其他插件的人格调用，也不会把客户端成功回执提升为微信实际送达证明。
 
-点「启动」按钮。连接成功后 AstrBot 的「平台」页应显示 txrui 为运行中，
-微信消息会进入 AstrBot 流水线。
+## 表情图片支持
 
-### 命令行方式（headless）
+- 接收端识别 `image`、`emoji`、`sticker` 段，以及采集端的 `text + extra.emoji` 格式：有已上传的媒体本体时转换成 AstrBot `Image`，没有本体时显示占位文字，不伪造图片。
+- 发送端支持其他插件产生的 `Image`，包括本地路径、`file://`、Base64、Data URI 及框架支持下载的 HTTP(S) 图片。
+- 本地表情图片直接读取原文件；GIF 保留原始字节与动画帧，不转换成静态 PNG。按图片文件头识别 PNG、JPEG、GIF、WebP、BMP，并修正发送文件名和 MIME，避免无扩展名缓存或错误扩展名导致客户端误识别。
+- 表情图片通过现有 `image` 段发送；微信最终如何显示、是否保留动画取决于桌面客户端的发送实现，不等同于微信收藏表情 API。
+- 针对 `meme_manager` 调用旧版人格接口的问题，本插件在其处理 txrui 请求时提供局部兼容：移除宿主不再支持的 `conversation_persona_id`、`provider_settings` 参数，将当前宿主的三项返回值补齐为旧调用需要的四项。人格选择仍由宿主的有效会话配置决定，不使用旧参数覆盖。
+- 兼容层仅包装表情插件实例的上下文和请求实现，不修改其他插件文件、宿主人格管理器或平台名称；其他平台调用保持原样。支持表情插件晚加载/重载，关闭 txrui 插件时恢复原实例属性。若表情插件没有生成或提交 `Image`，txrui 无法代替它选择表情。
+- 针对 `compact_meme_tool_history()` 将真实发送调用压缩成普通“已发送”文字的问题，txrui 在更高优先级的 `on_agent_done` 钩子中复用表情插件的预览清理：删除预览拼图和预览调用，保留 `send_meme`、`search_memes` 的结构化调用及原始结果（包括失败结果），不追加普通发送摘要。随后消费本轮跟踪标记，让表情插件原完成钩子跳过这一轮；无需替换宿主已注册的处理器。
+- 上述历史兼容仅对 txrui 生效，不修改 `keep_send_summary` 等共享配置，也不改变其他平台的历史处理。如果表情插件版本没有兼容的预览清理接口，则继续使用表情插件的原逻辑。
+- txrui 请求还会追加本轮发送约束：历史回执不代表本轮已发送，用户要求图片时应实际调用工具，仅在本轮工具返回成功后才声称成功。此约束是模型提示，不能保证所有模型都执行工具，也不会把普通文字自动转换为发送动作。
+- 更新后需重新加载 txrui 插件（连接会短暂重建），或在方便时重启 AstrBot。兼容只影响之后的处理，不改写已有会话历史；如果旧会话已有大量错误“已发送”回复，建议保留记录后新建会话验证。
 
-```bat
-cd txrui_desktop
-copy config.toml.example config.toml
-REM 编辑 config.toml 的 [astrbot] 段：
-REM   enabled = "1"
-REM   ws_url  = "ws://127.0.0.1:8788"
-REM   token   = "<与 AstrBot 插件一致的令牌>"
-python run.py --headless
-```
+## 协议确认、会话类型与账号路由
 
-## 安全提示
+- 群聊回复和主动发送携带 `outbound.payload.chat_type`（`group` / `private`），不要求根据群名猜测类型。直接调用 `send_outbound` 时也应传入 `chat_type`。
+- 事件接收回执为 `ack`，携带 `event_id`、`client_seq`、`ok`、`status` 和 `error`。`queued` 表示已提交 AstrBot 内存队列；`filtered` 表示按规则过滤；`rejected` 表示载荷无效；`failed` 表示处理异常。兼容旧自定义回调返回空值时，使用 `received`，只确认已调用处理器。
+- 接收回执不代表机器人处理完成、回复完成或消息已持久化。桌面端保留原有写帧后出队策略，本次不增加自动重发，避免在缺少服务端幂等处理时产生重复回复。
+- 回复按 `account_id` 与握手 `account_ids` 的逗号分隔账号精确匹配，不再把群名当账号搜索；找不到目标账号返回 `no_connection`，不回退到其他账号。相同账号重连时选择最新连接。
+- 主动发送默认使用该平台实例配置的 `account_id`；多账号主动发送应使用对应平台实例，或调用 `send_outbound(..., account_id=目标账号, chat_type=会话类型)` 明确指定。宿主平台管理器跳过已加载的同 ID 实例，避免插件恢复实例后又被启动流程重复创建，造成端口冲突和入站、出站使用不同实例。更新后需要重启 AstrBot 清理旧的重复实例。
+- 视频截图按 `image/png` 图片上传，内容段标记 `extra.original_type="video"`、`extra.preview=true`，摘要为“视频预览”；没有截图时保留视频占位，不冒充视频本体。插件也根据文件头兼容旧客户端误标为视频的图片。
 
-> **公网暴露必须配置 token。**
-> 若把 `host` 设为 `0.0.0.0` 且 `token` 留空，任何能连上该端口的人
-> 都可以注入伪造的微信消息。仅本机接入建议把 `host` 设为 `127.0.0.1`。
+## 发送结果与排障
 
-握手时 **connector_id 与 token 都要匹配**才放行，不匹配则直接关闭连接。
-
-## 协议说明
-
-### 上行（txrui -> AstrBot）
-
-| 帧 | AstrBot 侧行为 |
-|---|---|
-| `hello` | 校验 `connector_id` + `token`，通过后回 `hello_ack` |
-| `heartbeat` | 回 `heartbeat_ack` |
-| `event` | 转成 `AstrBotMessage` 后交给流水线 |
-| `media_upload` | 落盘去重后回 `media_ack`（含 `media_id`） |
-| `media_fetch` | 回 `media_fetch_ack`（含 base64 本体） |
-| `send_ack` | 按 `request_id` 唤醒对应的出站 Future |
-
-### 下行（AstrBot -> txrui）
-
-| 帧 | 说明 |
-|---|---|
-| `outbound` | `request_id` + `payload.content[]`，等待 `send_ack` |
-| `send_ack` | 由客户端回，确认出站结果 |
-
-### 段类型映射
-
-| AstrBot 组件 | 出站段 |
-|---|---|
-| `Plain` | `{"type": "text", "text": "..."}` |
-| `Image` | `{"type": "image", "media_id": ..., "mime": ..., "url": ...}` |
-| `Video` | `{"type": "video", ...}` |
-| `File` | `{"type": "file", ...}` |
-| `Record` | `{"type": "file", ...}` + `extra.file_fallback=true`（客户端不支持真语音） |
-
-### 媒体流向
-
-出站媒体**不是**服务端向客户端上传（客户端不处理 `media_upload` 帧）：
-
-```
-AstrBot 本地文件
-  -> 服务端 media_store 落盘（sha256 内容寻址，得到 media_id）
-  -> outbound 段里带 media_id
-  -> 客户端收到 outbound 后走 media_fetch 取回本体
-  -> 客户端粘贴进微信
-```
-
-## 配置参考
-
-`cmd_config.json` 的 `platform` 数组：
-
-```json
-{
-  "id": "txrui_default",
-  "type": "txrui",
-  "enable": false,
-  "host": "0.0.0.0",
-  "port": 8788,
-  "token": "",
-  "connector_id": "txrui_001",
-  "account_id": "wx_001",
-  "media_dir": "data/txrui_media"
-}
-```
-
-## 已知限制
-
-- **媒体索引不跨进程**：媒体本体落盘在 `media_dir`，但进程内索引（`media_id` ->
-  元信息）在重启后丢失。索引丢失时会按内容寻址路径自动回捞已落盘的 blob，
-  但 `mime`/`filename` 会退化为默认值。
-- **平台 ID 字符限制**：AstrBot 的 `PlatformManager` 会把 `id` 里的 `:` / `!`
-  自动替换成 `_`，前端还额外禁止空白字符。建议只用字母/数字/下划线/短横线。
-- **插件热重载**：`register_platform_adapter` 对重名注册会抛
-  `ValueError: 平台适配器 txrui 已经注册过了`。AstrBot 的
-  `unregister_platform_adapters_by_module` 会按模块路径自动注销，正常热重载没问题。
-- **不匹配 `@filter.platform_adapter_type`**：该过滤器的 `ADAPTER_NAME_2_TYPE`
-  是硬编码字典，自定义平台默认不匹配，本插件不依赖它。
-
-## 测试
-
-```bat
-cd AstrBot
-set ASTRBOT_DISABLE_METRICS=1
-python -m pytest data/plugins/astrbot_plugin_txrui/tests/ -q
-```
-
-> `ASTRBOT_DISABLE_METRICS=1` 用来关掉指标上报——`AstrMessageEvent.send()`
-> 会向外部服务 POST，离线环境下会导致 `asyncio.run()` 退出时卡住。
+- 普通回复和按会话主动发送均支持媒体：服务端保存媒体本体，下发 `media_id`，客户端通过 `media_fetch` 获取后发送到微信。
+- 客户端返回失败、连接不可用或确认超时，会抛出 `TxruiSendError` 反馈给调用插件，不再仅记录警告后当作成功。
+- 媒体不可读、存储失败或被配置禁用时，即使已发送降级提示文字，也会反馈原始媒体发送失败；混合消息中其他内容可能已经发出，请勿盲目整条重试。
+- 确认超时等结果未知的情况通过异常的 `unknown=True` 标记，插件不会自动重试，避免重复发送。
+- 日志中的“txrui 客户端确认发送”仅表示客户端返回成功确认。若微信仍未收到图片，需要继续检查客户端的媒体下载、粘贴与发送日志，确认客户端是在实际发送完成后才返回 `send_ack`。

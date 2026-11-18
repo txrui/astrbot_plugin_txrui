@@ -6,7 +6,7 @@
 
     hello         -> hello_ack
     heartbeat     -> heartbeat_ack
-    event         -> （转 AstrBotMessage，交给适配器入队）
+    event         -> ack（接收/入队状态，不表示机器人已回复）
     media_upload  -> media_ack
     media_fetch   -> media_fetch_ack
     send_ack      -> （唤醒对应的 outbound Future）
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import json
 import logging
@@ -233,6 +234,14 @@ class TxruiWSServer:
         account_id: str = "wx_001",
         media_dir: str = "data/txrui_media",
         on_event: Any = None,
+        max_media_bytes: int = MAX_MEDIA_BYTES,
+        max_frame_bytes: int = MAX_FRAME_BYTES,
+        send_ack_timeout: float = SEND_ACK_TIMEOUT,
+        handshake_timeout: float = 15.0,
+        heartbeat_interval: float = 0.0,
+        enable_media: bool = True,
+        debug_log: bool = False,
+        log_payload: bool = False,
     ) -> None:
         self.host = host
         self.port = int(port)
@@ -246,6 +255,17 @@ class TxruiWSServer:
         self._server: Any = None
         self._running = False
         self._conn_seq = 0
+        # ---- 可调运行时参数（来自平台配置）----
+        self.max_media_bytes = int(max_media_bytes)
+        self.max_frame_bytes = int(max_frame_bytes)
+        self.send_ack_timeout = float(send_ack_timeout)
+        self.handshake_timeout = float(handshake_timeout)
+        self.heartbeat_interval = float(heartbeat_interval)
+        self.enable_media = bool(enable_media)
+        self.debug_log = bool(debug_log)
+        self.log_payload = bool(log_payload)
+        # 心跳应答节流：记录最近一次应答时间
+        self._last_heartbeat_ack = 0.0
 
     # ---------- 连接管理 ----------
 
@@ -253,21 +273,25 @@ class TxruiWSServer:
     def connections(self) -> list[TxruiConnection]:
         return list(self._connections.values())
 
-    def find_connection(self, chat_id: str) -> TxruiConnection | None:
-        """按会话（chat_id）找目标连接。
+    def find_connection(
+        self, chat_id: str = "", account_id: str = ""
+    ) -> TxruiConnection | None:
+        """按账号精确路由；同账号重连取最新连接，绝不回退到其他账号。
 
-        微信 PC 端通常只有一路连接；多路时优先取最近连接。
+        chat_id 保留为旧调用方兼容参数，不用于匹配账号声明。
+        未声明账号的旧客户端仅在唯一连接且目标为默认账号时兼容。
         """
+        target = str(account_id or self.account_id).strip()
         candidates = [
-            conn
-            for conn in self._connections.values()
-            if not conn.account_ids or chat_id in conn.account_ids
+            conn for conn in self._connections.values()
+            if target in {part.strip() for part in conn.account_ids.split(",")
+                          if part.strip()}
         ]
-        if not candidates:
-            candidates = list(self._connections.values())
-        if not candidates:
-            return None
-        return max(candidates, key=lambda c: c.connected_at)
+        if not candidates and len(self._connections) == 1 and target == self.account_id:
+            legacy = next(iter(self._connections.values()))
+            if not legacy.account_ids.strip():
+                candidates = [legacy]
+        return max(candidates, key=lambda c: c.connected_at) if candidates else None
 
     # ---------- 生命周期 ----------
 
@@ -280,18 +304,39 @@ class TxruiWSServer:
         except ImportError:  # pragma: no cover - 老版本 websockets 兜底
             from websockets.server import serve  # type: ignore[no-redef]
 
-        self._server = await serve(
-            self._handler,
-            self.host,
-            self.port,
-            max_size=MAX_FRAME_BYTES,
-        )
+        try:
+            self._server = await serve(
+                self._handler,
+                self.host,
+                self.port,
+                max_size=self.max_frame_bytes,
+            )
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                raise OSError(
+                    f"txrui WebSocket 服务端无法绑定 {self.host}:{self.port}："
+                    "端口仍被占用（可能属于当前 AstrBot 进程中的重复 txrui 实例）。"
+                    "插件不会自动结束其他进程；请检查重复实例或其他服务是否占用该端口。"
+                ) from e
+            if e.errno in (errno.EACCES, errno.EPERM):
+                raise OSError(
+                    f"txrui WebSocket 服务端启动失败：当前运行用户无权监听 "
+                    f"{self.host}:{self.port}，请检查端口权限和安全策略。"
+                ) from e
+            raise OSError(
+                f"txrui WebSocket 服务端启动失败 ({self.host}:{self.port}): {e}"
+            ) from e
         self._running = True
         logger.info("txrui WS 服务端已监听 %s:%s", self.host, self.port)
 
     async def stop(self) -> None:
-        """关闭服务端并断开所有连接。"""
+        """停止接受新连接、关闭活动连接并释放监听端口。"""
         self._running = False
+        server, self._server = self._server, None
+        if server is not None:
+            # 先关闭监听 socket，避免停止期间继续接受连接；wait_closed 确认
+            # 底层 socket 已关闭后，平台重载才可安全重新绑定同一端口。
+            server.close()
         for conn in list(self._connections.values()):
             conn.fail_pending("server_stopped")
             try:
@@ -299,14 +344,12 @@ class TxruiWSServer:
             except Exception:  # noqa: BLE001
                 pass
         self._connections.clear()
-        if self._server is not None:
+        if server is not None:
             try:
-                self._server.close()
-                await self._server.wait_closed()
+                await server.wait_closed()
             except Exception:  # noqa: BLE001
-                pass
-            self._server = None
-        logger.info("txrui WS 服务端已关闭")
+                logger.exception("txrui WebSocket 服务端等待关闭时发生错误")
+        logger.info("txrui WS 服务端已关闭并释放监听端口 %s:%s", self.host, self.port)
 
     # ---------- 握手 ----------
 
@@ -357,7 +400,7 @@ class TxruiWSServer:
         """单连接的帧处理循环。"""
         conn_id = ""
         try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+            raw = await asyncio.wait_for(ws.recv(), timeout=self.handshake_timeout)
             hello = json.loads(raw)
             conn = await self._handle_hello_frame(ws, hello)
             conn_id = next(
@@ -404,7 +447,7 @@ class TxruiWSServer:
     async def _dispatch(self, conn: TxruiConnection, msg: dict) -> None:
         mtype = str(msg.get("type") or "")
         if mtype == "heartbeat":
-            await conn.send_json({"type": "heartbeat_ack", "ts": int(time.time())})
+            await self._handle_heartbeat(conn)
             return
         if mtype == "event":
             await self._handle_event(conn, msg)
@@ -423,22 +466,61 @@ class TxruiWSServer:
             return
         logger.debug("txrui 收到未知帧类型: %s", mtype)
 
+    async def _handle_heartbeat(self, conn: TxruiConnection) -> None:
+        """应答心跳。
+
+        `heartbeat_interval` > 0 时做节流：间隔内的重复心跳直接忽略，
+        避免客户端高频心跳把服务端写锁占满。
+        """
+        if self.heartbeat_interval > 0:
+            now = time.time()
+            if now - self._last_heartbeat_ack < self.heartbeat_interval:
+                return
+            self._last_heartbeat_ack = now
+        await conn.send_json({"type": "heartbeat_ack", "ts": int(time.time())})
+
     async def _handle_event(self, conn: TxruiConnection, msg: dict) -> None:
+        """回执仅确认协议接收/适配器入队，不表示机器人处理或回复完成。"""
         payload = msg.get("payload")
+        ack = {"type": "ack", "event_id": "", "client_seq": "",
+               "ok": False, "status": "rejected", "error": ""}
         if not isinstance(payload, dict):
-            logger.warning("txrui event 帧缺少 payload，忽略")
-            return
-        if self._on_event is None:
-            logger.warning("txrui event 帧无处理器，忽略")
-            return
-        try:
-            result = self._on_event(payload, conn)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as e:  # noqa: BLE001
-            logger.exception("txrui event 处理失败: %s", e)
+            ack["error"] = "invalid_payload"
+        else:
+            ack["event_id"] = str(payload.get("event_id") or "")
+            ack["client_seq"] = str(payload.get("client_seq") or "")
+            if self._on_event is None:
+                ack["error"] = "no_event_handler"
+            else:
+                try:
+                    result = self._on_event(payload, conn)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    if isinstance(result, dict):
+                        ack.update({key: result[key] for key in ("ok", "status", "error")
+                                    if key in result})
+                    else:
+                        # 兼容旧回调：返回 None 只确认已交给回调，不谎称已入队。
+                        ack.update(ok=True, status="received")
+                except Exception:  # noqa: BLE001
+                    logger.exception("txrui event 处理失败")
+                    ack.update(ok=False, status="failed", error="event_handler_failed")
+        await conn.send_json(ack)
 
     async def _handle_media_upload(self, conn: TxruiConnection, msg: dict) -> None:
+        if not self.enable_media:
+            await conn.send_json(
+                {
+                    "type": "media_ack",
+                    "client_seq": str(msg.get("client_seq") or ""),
+                    "ok": False,
+                    "media_id": "",
+                    "mime": "",
+                    "size": 0,
+                    "error": "media_disabled",
+                }
+            )
+            return
         client_seq = str(msg.get("client_seq") or "")
         data_b64 = str(msg.get("data_b64") or "")
         filename = str(msg.get("filename") or "media")
@@ -460,7 +542,7 @@ class TxruiWSServer:
                 }
             )
             return
-        if len(data) > MAX_MEDIA_BYTES:
+        if len(data) > self.max_media_bytes:
             await conn.send_json(
                 {
                     "type": "media_ack",
@@ -552,12 +634,13 @@ class TxruiWSServer:
         content: list[dict],
         account_id: str = "",
         request_id: str = "",
+        chat_type: str = "",
     ) -> dict:
         """下发一条 outbound 指令并等待 send_ack。
 
         返回 send_ack 的结果 dict（超时/失败时 `ok=False`）。
         """
-        conn = self.find_connection(chat_id)
+        conn = self.find_connection(chat_id, account_id=account_id)
         if conn is None:
             return {"ok": False, "error": "no_connection", "unknown": False}
         if not content:
@@ -575,6 +658,9 @@ class TxruiWSServer:
             "chat_id": chat_id,
             "content": content,
         }
+        normalized_type = str(chat_type or "").strip().lower()
+        if normalized_type in ("group", "private"):
+            payload["chat_type"] = normalized_type
         try:
             await conn.send_json(
                 {"type": "outbound", "request_id": rid, "payload": payload}
@@ -584,7 +670,9 @@ class TxruiWSServer:
             return {"ok": False, "unknown": True, "error": f"send_failed:{str(e)[:120]}"}
 
         try:
-            result = await asyncio.wait_for(asyncio.shield(fut), timeout=SEND_ACK_TIMEOUT)
+            result = await asyncio.wait_for(
+                asyncio.shield(fut), timeout=self.send_ack_timeout
+            )
         except asyncio.TimeoutError:
             conn._pending.pop(rid, None)
             return {"ok": False, "unknown": True, "error": "timeout_unknown"}
